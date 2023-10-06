@@ -39,6 +39,11 @@
 #include <time.h>
 #include <zlib.h>
 
+#include "config.h"
+#ifdef HAVE_LIBNATSPEC
+#include <natspec.h>
+#endif
+
 #include "zipint.h"
 
 static zip_string_t *_zip_dirent_process_ef_utf_8(const zip_dirent_t *de, zip_uint16_t id, zip_string_t *str);
@@ -335,6 +340,79 @@ _zip_dirent_new(void) {
     return de;
 }
 
+#ifdef HAVE_LIBNATSPEC
+static bool _zip_is_libnatspec_enabled() {
+    const char *enable_natspec_env = getenv("LIBZIP_ENABLE_LIBNATSPEC");
+    return enable_natspec_env && (strcmp(enable_natspec_env, "1") == 0);
+}
+
+static char* _zip_natspec_convert(const char *in_str, const char *tocode, const char *fromcode) {
+    iconv_t handle = natspec_iconv_open(tocode, fromcode);
+    if (handle == (iconv_t) -1) {
+        return NULL;
+    }
+
+    char *src = (char *)in_str;
+    size_t src_length = strlen(src);
+    size_t converted_length = src_length * 6; // six bytes per symbol
+    char *converted = (char *)alloca(converted_length);
+    char *converted_ptr = converted;
+    const size_t res = natspec_iconv(handle, &src, &src_length, &converted_ptr, &converted_length, 0);
+    natspec_iconv_close(handle);
+    if (res != 0) {
+        return NULL;
+    }
+
+    *converted_ptr = '\0';
+    return strdup(converted);
+}
+
+static void _zip_natspec_convert_to_utf8(zip_string_t *string) {
+    if (string == NULL) {
+        return;
+    }
+
+    const zip_encoding_type_t type = _zip_guess_encoding(string, ZIP_ENCODING_UNKNOWN);
+    if (type == ZIP_ENCODING_UTF8_KNOWN && type == ZIP_ENCODING_UTF8_GUESSED) {
+        return;
+    }
+
+    const char *fileenc = natspec_get_filename_encoding("");
+    const char *archive_oem_charset = natspec_get_charset_by_locale(NATSPEC_DOSCS, "");
+    char *converted = _zip_natspec_convert((const char *)(string->raw), fileenc, archive_oem_charset);
+    if (converted) {
+        free(string->converted);
+        string->converted = (zip_uint8_t *)converted;
+        string->converted_length = (zip_uint32_t)strlen(converted);
+    }
+}
+
+static bool _zip_natspec_convert_from_utf8(zip_string_t *string) {
+    if (string == NULL) {
+        return false;
+    }
+
+    const zip_encoding_type_t type = _zip_guess_encoding(string, ZIP_ENCODING_UNKNOWN);
+    if (type != ZIP_ENCODING_UTF8_KNOWN && type != ZIP_ENCODING_UTF8_GUESSED) {
+        return false;
+    }
+
+    const char *fileenc = natspec_get_filename_encoding("");
+    const char *archive_oem_charset = natspec_get_charset_by_locale(NATSPEC_DOSCS, "");
+    char *filename_raw = _zip_natspec_convert((const char *)string->raw, archive_oem_charset, fileenc);
+    if (!filename_raw) {
+        return false;
+    }
+
+    free(string->converted);
+    string->converted = string->raw;
+    string->converted_length = string->length;
+    string->encoding = ZIP_ENCODING_CP437;
+    string->raw = (zip_uint8_t *)filename_raw;
+    string->length = (zip_uint16_t)strlen(filename_raw);
+    return true;
+}
+#endif
 
 /* _zip_dirent_read(zde, fp, bufp, left, localp, error):
    Fills the zip directory entry zde.
@@ -477,6 +555,11 @@ _zip_dirent_read(zip_dirent_t *zde, zip_source_t *src, zip_buffer_t *buffer, boo
                 return -1;
             }
         }
+#ifdef HAVE_LIBNATSPEC
+        else if (_zip_is_libnatspec_enabled()) {
+            _zip_natspec_convert_to_utf8(zde->filename);
+        }
+#endif
     }
 
     if (ef_len) {
@@ -800,8 +883,28 @@ _zip_dirent_write(zip_t *za, zip_dirent_t *de, zip_flags_t flags) {
 
     ef = NULL;
 
+    zip_uint16_t version_madeby = de->version_madeby;
+    zip_string_t *filename = NULL;
+    if (de->filename) {
+        filename = _zip_string_new(de->filename->raw, de->filename->length, ZIP_FL_ENC_GUESS, &za->error);
+        if (!filename) {
+            return -1;
+        }
+    }
+
     name_enc = _zip_guess_encoding(de->filename, ZIP_ENCODING_UNKNOWN);
     com_enc = _zip_guess_encoding(de->comment, ZIP_ENCODING_UNKNOWN);
+
+#ifdef HAVE_LIBNATSPEC
+    if (_zip_is_libnatspec_enabled() && (de->changed & ZIP_DIRENT_FILENAME)) {
+        if (name_enc == ZIP_ENCODING_UTF8_KNOWN || name_enc == ZIP_ENCODING_UTF8_GUESSED) {
+            if (_zip_natspec_convert_from_utf8(filename)) {
+                name_enc = ZIP_ENCODING_CP437;
+                version_madeby = ZIP_OPSYS_MVS << 8;
+            }
+        }
+    }
+#endif
 
     if ((name_enc == ZIP_ENCODING_UTF8_KNOWN && com_enc == ZIP_ENCODING_ASCII) || (name_enc == ZIP_ENCODING_ASCII && com_enc == ZIP_ENCODING_UTF8_KNOWN) || (name_enc == ZIP_ENCODING_UTF8_KNOWN && com_enc == ZIP_ENCODING_UTF8_KNOWN))
         de->bitflags |= ZIP_GPBF_ENCODING_UTF_8;
@@ -809,13 +912,41 @@ _zip_dirent_write(zip_t *za, zip_dirent_t *de, zip_flags_t flags) {
         de->bitflags &= (zip_uint16_t)~ZIP_GPBF_ENCODING_UTF_8;
         if (name_enc == ZIP_ENCODING_UTF8_KNOWN) {
             ef = _zip_ef_utf8(ZIP_EF_UTF_8_NAME, de->filename, &za->error);
-            if (ef == NULL)
+            if (ef == NULL) {
+                _zip_string_free(filename);
                 return -1;
+            }
         }
+#ifdef HAVE_LIBNATSPEC
+        else if (_zip_is_libnatspec_enabled() && de->filename) {
+            zip_encoding_type_t filename_ef_encoding = _zip_guess_encoding(de->filename, ZIP_ENCODING_UNKNOWN);
+            zip_string_t *filename_ef = NULL;
+            if (filename_ef_encoding == ZIP_ENCODING_UTF8_KNOWN || filename_ef_encoding == ZIP_ENCODING_UTF8_GUESSED) {
+                filename_ef = _zip_string_new(de->filename->raw, de->filename->length, ZIP_FL_ENC_GUESS, &za->error);
+            } else if (de->filename->converted) {
+                filename_ef = _zip_string_new(de->filename->converted, de->filename->converted_length, ZIP_FL_ENC_GUESS, &za->error);
+            } else {
+                filename_ef = _zip_string_new(de->filename->raw, de->filename->length, ZIP_FL_ENC_GUESS, &za->error);
+                _zip_natspec_convert_to_utf8(filename_ef);
+                free(filename_ef->raw);
+                filename_ef->raw = filename_ef->converted;
+                filename_ef->length = filename_ef->converted_length;
+                filename_ef->encoding = ZIP_ENCODING_UTF8_KNOWN;
+                filename_ef->converted = NULL;
+                filename_ef->converted_length = 0;
+            }
+            if (filename_ef->raw) {
+                ef = _zip_ef_utf8(ZIP_EF_UTF_8_NAME, filename_ef, &za->error);
+            }
+            _zip_string_free(filename_ef);
+        }
+#endif
+
         if ((flags & ZIP_FL_LOCAL) == 0 && com_enc == ZIP_ENCODING_UTF8_KNOWN) {
             zip_extra_field_t *ef2 = _zip_ef_utf8(ZIP_EF_UTF_8_COMMENT, de->comment, &za->error);
             if (ef2 == NULL) {
                 _zip_ef_free(ef);
+                _zip_string_free(filename);
                 return -1;
             }
             ef2->next = ef;
@@ -840,6 +971,7 @@ _zip_dirent_write(zip_t *za, zip_dirent_t *de, zip_flags_t flags) {
         if (ef_buffer == NULL) {
             zip_error_set(&za->error, ZIP_ER_MEMORY, 0);
             _zip_ef_free(ef);
+            _zip_string_free(filename);
             return -1;
         }
 
@@ -867,6 +999,7 @@ _zip_dirent_write(zip_t *za, zip_dirent_t *de, zip_flags_t flags) {
             zip_error_set(&za->error, ZIP_ER_INTERNAL, 0);
             _zip_buffer_free(ef_buffer);
             _zip_ef_free(ef);
+            _zip_string_free(filename);
             return -1;
         }
 
@@ -884,6 +1017,7 @@ _zip_dirent_write(zip_t *za, zip_dirent_t *de, zip_flags_t flags) {
         if (ef_buffer == NULL) {
             zip_error_set(&za->error, ZIP_ER_MEMORY, 0);
             _zip_ef_free(ef);
+            _zip_string_free(filename);
             return -1;
         }
 
@@ -896,6 +1030,7 @@ _zip_dirent_write(zip_t *za, zip_dirent_t *de, zip_flags_t flags) {
             zip_error_set(&za->error, ZIP_ER_INTERNAL, 0);
             _zip_buffer_free(ef_buffer);
             _zip_ef_free(ef);
+            _zip_string_free(filename);
             return -1;
         }
 
@@ -908,13 +1043,14 @@ _zip_dirent_write(zip_t *za, zip_dirent_t *de, zip_flags_t flags) {
     if ((buffer = _zip_buffer_new(buf, sizeof(buf))) == NULL) {
         zip_error_set(&za->error, ZIP_ER_MEMORY, 0);
         _zip_ef_free(ef);
+        _zip_string_free(filename);
         return -1;
     }
 
     _zip_buffer_put(buffer, (flags & ZIP_FL_LOCAL) ? LOCAL_MAGIC : CENTRAL_MAGIC, 4);
 
     if ((flags & ZIP_FL_LOCAL) == 0) {
-        _zip_buffer_put_16(buffer, de->version_madeby);
+        _zip_buffer_put_16(buffer, version_madeby);
     }
     _zip_buffer_put_16(buffer, ZIP_MAX(is_really_zip64 ? 45 : 0, de->version_needed));
     _zip_buffer_put_16(buffer, de->bitflags);
@@ -966,7 +1102,7 @@ _zip_dirent_write(zip_t *za, zip_dirent_t *de, zip_flags_t flags) {
         }
     }
 
-    _zip_buffer_put_16(buffer, _zip_string_length(de->filename));
+    _zip_buffer_put_16(buffer, _zip_string_length(filename));
     ef_total_size = (zip_uint32_t)_zip_ef_size(ef, ZIP_EF_BOTH);
     if (!ZIP_WANT_TORRENTZIP(za)) {
         /* TODO: check for overflow */
@@ -989,23 +1125,28 @@ _zip_dirent_write(zip_t *za, zip_dirent_t *de, zip_flags_t flags) {
         zip_error_set(&za->error, ZIP_ER_INTERNAL, 0);
         _zip_buffer_free(buffer);
         _zip_ef_free(ef);
+        _zip_string_free(filename);
         return -1;
     }
 
     if (_zip_write(za, buf, _zip_buffer_offset(buffer)) < 0) {
         _zip_buffer_free(buffer);
         _zip_ef_free(ef);
+        _zip_string_free(filename);
         return -1;
     }
 
     _zip_buffer_free(buffer);
 
-    if (de->filename) {
-        if (_zip_string_write(za, de->filename) < 0) {
+    if (filename) {
+        if (_zip_string_write(za, filename) < 0) {
             _zip_ef_free(ef);
+            _zip_string_free(filename);
             return -1;
         }
     }
+
+    _zip_string_free(filename);
 
     if (ef) {
         if (_zip_ef_write(za, ef, ZIP_EF_BOTH) < 0) {

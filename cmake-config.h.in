@@ -65,6 +65,7 @@
 #cmakedefine HAVE_SYS_NDIR_H
 #cmakedefine WORDS_BIGENDIAN
 #cmakedefine HAVE_SHARED
+#cmakedefine HAVE_LIBNATSPEC
 /* END DEFINES */
 #define PACKAGE "@CMAKE_PROJECT_NAME@"
 #define VERSION "@CMAKE_PROJECT_VERSION@"
