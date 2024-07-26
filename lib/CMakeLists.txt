@@ -172,6 +172,10 @@ if(HAVE_CRYPTO)
   target_sources(zip PRIVATE zip_winzip_aes.c zip_source_winzip_aes_decode.c zip_source_winzip_aes_encode.c)
 endif()
 
+if (HAVE_LIBNATSPEC)
+    target_link_libraries(zip PRIVATE ${LIBNATSPEC})
+endif()
+
 if(SHARED_LIB_VERSIONNING)
   # MACHO_*_VERSION can be removed when SOVERSION gets increased. Cf #405
   set_target_properties(zip PROPERTIES VERSION 5.5 SOVERSION 5 MACHO_CURRENT_VERSION 6.5 MACHO_COMPATIBILITY_VERSION 6)

@@ -21,6 +21,10 @@ option(ENABLE_ZSTD "Enable use of Zstandard" ON)
 
 option(ENABLE_FDOPEN "Enable zip_fdopen, which is not allowed in Microsoft CRT secure libraries" ON)
 
+if (UNIX)
+    option(ENABLE_LIBNATSPEC "Enable use of libnatspec" ON)
+endif()
+
 option(BUILD_TOOLS "Build tools in the src directory (zipcmp, zipmerge, ziptool)" ON)
 option(BUILD_REGRESS "Build regression tests" ON)
 option(BUILD_OSSFUZZ "Build fuzzers for ossfuzz" ON)
@@ -252,6 +256,15 @@ if(ENABLE_ZSTD)
     message(WARNING "-- zstd library not found; zstandard support disabled")
   endif(zstd_FOUND)
 endif(ENABLE_ZSTD)
+
+if (ENABLE_LIBNATSPEC)
+    find_library(LIBNATSPEC NAMES natspec)
+    if (LIBNATSPEC)
+        set(HAVE_LIBNATSPEC 1)
+    else()
+        message(WARNING "-- libnatspec not found; libnatspec support disabled")
+    endif()
+endif()
 
 if (COMMONCRYPTO_FOUND)
   set(HAVE_CRYPTO 1)
